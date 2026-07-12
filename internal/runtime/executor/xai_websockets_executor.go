@@ -578,6 +578,8 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 		var param any
 		outputItemsByIndex := make(map[int64][]byte)
 		var outputItemsFallback [][]byte
+		droppedOutputIndexes := make(map[int64]struct{})
+		customOutputIndexes := make(map[int64]struct{})
 		recordedTranscript := false
 		for {
 			if ctx != nil && ctx.Err() != nil {
@@ -647,6 +649,19 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 						logXAIWebsocketWarmupCompleted(executionSessionID, authID, wsURL, payload)
 					}
 				case "response.output_item.done":
+					if xaiShouldHideInjectedSearchResults(e.cfg) {
+						filtered := filterXAIInjectedServerToolPayload(payload)
+						if len(filtered) == 0 {
+							xaiRecordDroppedOutputIndex(payload, droppedOutputIndexes)
+							continue
+						}
+						payload = filtered
+					}
+					payload = xaiCompactOutputIndex(payload, droppedOutputIndexes)
+					// Remap promoted custom tools after compact so tracked indexes
+					// match the client-facing stream (parity with HTTP ExecuteStream).
+					payload = remapXAICustomToolCallsInPayload(payload, prepared.customToolNames)
+					xaiTrackCustomOutputIndex(payload, customOutputIndexes)
 					xaiCollectOutputItemDone(payload, outputItemsByIndex, &outputItemsFallback)
 				case "response.completed":
 					logXAIWebsocketTerminalResponse(executionSessionID, authID, wsURL, eventType, payload)
@@ -655,6 +670,10 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 					}
 					payload = xaiPatchCompletedOutput(payload, outputItemsByIndex, outputItemsFallback)
 					payload = xaiNormalizeReasoningSummaryData(payload)
+					if xaiShouldHideInjectedSearchResults(e.cfg) {
+						payload = filterXAIInjectedServerToolPayload(payload)
+					}
+					payload = remapXAICustomToolCallsInPayload(payload, prepared.customToolNames)
 					cacheXAIReasoningReplayFromCompleted(ctx, prepared.replayScope, payload)
 					if !warmupRequest && idMapper != nil && idMapper.state != nil && !recordedTranscript {
 						idMapper.state.recordTranscriptTurn(wsReqBody, payload)
@@ -665,9 +684,32 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 					if detail, ok := helps.ParseCodexUsage(payload); ok {
 						reporter.Publish(ctx, detail)
 					}
+					if xaiShouldHideInjectedSearchResults(e.cfg) {
+						payload = filterXAIInjectedServerToolPayload(payload)
+					}
+					payload = remapXAICustomToolCallsInPayload(payload, prepared.customToolNames)
 					if !warmupRequest && idMapper != nil && idMapper.state != nil && !recordedTranscript {
 						idMapper.state.recordTranscriptTurn(wsReqBody, payload)
 						recordedTranscript = true
+					}
+				default:
+					if xaiShouldHideInjectedSearchResults(e.cfg) {
+						if xaiIsInjectedServerToolEvent(payload) {
+							xaiRecordDroppedOutputIndex(payload, droppedOutputIndexes)
+							continue
+						}
+						if xaiOutputIndexIsDropped(payload, droppedOutputIndexes) {
+							continue
+						}
+					}
+					payload = xaiCompactOutputIndex(payload, droppedOutputIndexes)
+					// Remap item-bearing events and translate argument stream events
+					// for custom tools only. Nil means drop (partial JSON deltas).
+					payload = remapXAICustomToolCallsInPayload(payload, prepared.customToolNames)
+					xaiTrackCustomOutputIndex(payload, customOutputIndexes)
+					payload = translateXAICustomToolCallInputEvents(payload, customOutputIndexes)
+					if payload == nil {
+						continue
 					}
 				}
 
@@ -869,7 +911,7 @@ func xaiBareWebsocketErrorStatus(payload []byte) int {
 }
 
 func (e *XAIWebsocketsExecutor) prepareResponsesWebsocketRequest(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*xaiPreparedRequest, error) {
-	prepared, err := e.prepareResponsesRequest(ctx, req, opts, true)
+	prepared, err := e.prepareResponsesRequestKeepingPreviousResponseToolOutputs(ctx, req, opts, true)
 	if err != nil {
 		return nil, err
 	}
