@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -77,7 +78,25 @@ const (
 	xaiTokenAuthValue           = "xai-grok-cli"
 	xaiClientVersionHeader      = "x-grok-client-version"
 	// Keep in sync with the current Grok CLI client version that chat-proxy expects.
-	xaiClientVersionValue = "0.2.93"
+	xaiClientVersionValue         = "0.2.93"
+	xaiClientIdentifierHeader     = "x-grok-client-identifier"
+	xaiClientIdentifierValue      = "grok-shell"
+	xaiClientNameHeader           = "x-grok-client-name"
+	xaiClientNameValue            = "grok-shell"
+	xaiClientSurfaceHeader        = "x-grok-client-surface"
+	xaiClientSurfaceValue         = "tui"
+	xaiAuthenticateResponseHeader = "x-authenticateresponse"
+	xaiAuthenticateResponseValue  = "authenticate-response"
+	xaiModelOverrideHeader        = "x-grok-model-override"
+	xaiReqIDHeader                = "x-grok-req-id"
+	xaiRequestIDLegacyHeader      = "x-grok-request-id"
+	xaiSessionIDHeader            = "x-grok-session-id"
+	xaiSessionIDLegacyHeader      = "x-grok-session-id-legacy"
+	xaiAgentIDHeader              = "x-grok-agent-id"
+	xaiConvIDHeader               = "x-grok-conv-id"
+	xaiConversationIDLegacyHeader = "x-grok-conversation-id"
+	xaiUserIDHeader               = "x-userid"
+	xaiEmailHeader                = "x-email"
 	// xaiUsingAPIAttr enables the official API path for non-media HTTP chat.
 	xaiUsingAPIAttr = "using_api"
 )
@@ -158,9 +177,8 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 	if err != nil {
 		return resp, err
 	}
-	applyXAIChatHeaders(httpReq, auth, token, true, prepared.sessionID)
+	applyXAIChatHeaders(httpReq, auth, token, true, prepared.sessionID, prepared.baseModel)
 	e.recordXAIRequest(ctx, auth, url, httpReq.Header.Clone(), prepared.body)
-
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
 	httpResp, err := httpClient.Do(httpReq)
@@ -263,7 +281,7 @@ func (e *XAIExecutor) executeCompactRequest(ctx context.Context, auth *cliproxya
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	applyXAIChatHeaders(httpReq, auth, token, false, prepared.sessionID)
+	applyXAIChatHeaders(httpReq, auth, token, false, prepared.sessionID, prepared.baseModel)
 	e.recordXAIRequest(ctx, auth, requestURL, httpReq.Header.Clone(), prepared.body)
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
@@ -625,7 +643,7 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 	if err != nil {
 		return nil, err
 	}
-	applyXAIChatHeaders(httpReq, auth, token, true, prepared.sessionID)
+	applyXAIChatHeaders(httpReq, auth, token, true, prepared.sessionID, prepared.baseModel)
 	e.recordXAIRequest(ctx, auth, url, httpReq.Header.Clone(), prepared.body)
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
@@ -1109,7 +1127,7 @@ func applyXAIDefaultHeaders(r *http.Request, token string, stream bool, sessionI
 	}
 	r.Header.Set("Connection", "Keep-Alive")
 	if sessionID != "" {
-		r.Header.Set("x-grok-conv-id", sessionID)
+		r.Header.Set(xaiConvIDHeader, sessionID)
 	}
 }
 
@@ -1123,20 +1141,101 @@ func applyXAICustomHeaders(r *http.Request, auth *cliproxyauth.Auth) {
 
 // applyXAIChatHeaders applies standard xAI headers for non-image/video chat
 // requests. When using_api is true, this matches the standard
-// applyXAIHeaders behavior. CLI chat-proxy identity headers are only attached
-// when using_api is false and the resolved chat base URL is the official CLI
-// chat-proxy endpoint.
-func applyXAIChatHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, sessionID string) {
+// applyXAIHeaders behavior. When using_api is false and the resolved chat base
+// URL is the official CLI chat-proxy endpoint, attach Grok Build CLI identity
+// and routing headers so requests match native CLI captures.
+// model is used only for x-grok-model-override on the chat-proxy path.
+// Custom auth headers still override these defaults when present.
+func applyXAIChatHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, sessionID, model string) {
 	if xaiUsingAPI(auth) {
 		applyXAIHeaders(r, auth, token, stream, sessionID)
 		return
 	}
 	applyXAIDefaultHeaders(r, token, stream, sessionID)
 	if xaiIsCLIChatProxyBaseURL(xaiChatBaseURL(auth)) {
-		r.Header.Set(xaiTokenAuthHeader, xaiTokenAuthValue)
-		r.Header.Set(xaiClientVersionHeader, xaiClientVersionValue)
+		applyXAICLIChatProxyIdentityHeaders(r, auth, sessionID, model)
 	}
 	applyXAICustomHeaders(r, auth)
+}
+
+// applyXAICLIChatProxyIdentityHeaders sets Grok Build CLI headers for
+// cli-chat-proxy to match native CLI captures / grokcli2api BuildHeaders:
+// identity, authenticate-response, model override, session affinity IDs,
+// legacy dual-write fields, optional user identity, and W3C traceparent.
+func applyXAICLIChatProxyIdentityHeaders(r *http.Request, auth *cliproxyauth.Auth, sessionID, model string) {
+	if r == nil {
+		return
+	}
+	r.Header.Set(xaiTokenAuthHeader, xaiTokenAuthValue)
+	r.Header.Set(xaiClientVersionHeader, xaiClientVersionValue)
+	r.Header.Set(xaiClientIdentifierHeader, xaiClientIdentifierValue)
+	r.Header.Set(xaiClientNameHeader, xaiClientNameValue)
+	r.Header.Set(xaiClientSurfaceHeader, xaiClientSurfaceValue)
+	r.Header.Set(xaiAuthenticateResponseHeader, xaiAuthenticateResponseValue)
+	r.Header.Set("User-Agent", xaiCLIChatUserAgent())
+	if model = strings.TrimSpace(model); model != "" {
+		r.Header.Set(xaiModelOverrideHeader, model)
+	}
+
+	reqID := uuid.NewString()
+	sessionID = strings.TrimSpace(sessionID)
+	agentID := ""
+	if sessionID != "" {
+		// Keep session/agent/conv affinity aligned with prompt_cache_key.
+		agentID = sessionID
+	} else {
+		// No multi-turn affinity key: still emit a full CLI identity tuple.
+		sessionID = uuid.NewString()
+		agentID = uuid.NewString()
+		// applyXAIDefaultHeaders only sets conv-id when sessionID was non-empty.
+		r.Header.Set(xaiConvIDHeader, sessionID)
+	}
+
+	r.Header.Set(xaiReqIDHeader, reqID)
+	r.Header.Set(xaiSessionIDHeader, sessionID)
+	r.Header.Set(xaiAgentIDHeader, agentID)
+	// Legacy dual-write present on native CLI / grokcli2api captures.
+	r.Header.Set(xaiRequestIDLegacyHeader, reqID)
+	r.Header.Set(xaiSessionIDLegacyHeader, sessionID)
+	if convID := strings.TrimSpace(r.Header.Get(xaiConvIDHeader)); convID != "" {
+		r.Header.Set(xaiConversationIDLegacyHeader, convID)
+	} else {
+		r.Header.Set(xaiConversationIDLegacyHeader, sessionID)
+	}
+
+	if userID := xaiAuthIdentityValue(auth, "sub"); userID != "" {
+		r.Header.Set(xaiUserIDHeader, userID)
+	}
+	if email := xaiAuthIdentityValue(auth, "email"); email != "" {
+		r.Header.Set(xaiEmailHeader, email)
+	}
+
+	// W3C trace context; native CLI / grokcli2api emit these on chat-proxy.
+	r.Header.Set("traceparent", xaiTraceparent())
+	r.Header.Set("tracestate", "")
+}
+
+func xaiCLIChatUserAgent() string {
+	return fmt.Sprintf("%s/%s (%s; %s)", xaiClientIdentifierValue, xaiClientVersionValue, runtime.GOOS, runtime.GOARCH)
+}
+
+func xaiAuthIdentityValue(auth *cliproxyauth.Auth, key string) string {
+	if auth == nil {
+		return ""
+	}
+	if auth.Attributes != nil {
+		if v := strings.TrimSpace(auth.Attributes[key]); v != "" {
+			return v
+		}
+	}
+	return xaiMetadataString(auth.Metadata, key)
+}
+
+func xaiTraceparent() string {
+	// 00-<32 hex trace id>-<16 hex parent id>-01
+	traceID := strings.ReplaceAll(uuid.NewString(), "-", "")
+	parentID := strings.ReplaceAll(uuid.NewString(), "-", "")[:16]
+	return "00-" + traceID + "-" + parentID + "-01"
 }
 
 func xaiResolveComposerSessionID(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, baseModel string) (string, error) {

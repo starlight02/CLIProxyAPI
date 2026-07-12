@@ -1804,7 +1804,7 @@ func TestApplyXAIChatHeaders(t *testing.T) {
 		auth := &cliproxyauth.Auth{
 			Attributes: map[string]string{"base_url": xaiauth.DefaultAPIBaseURL},
 		}
-		applyXAIChatHeaders(req, auth, "xai-token", true, "conv-1")
+		applyXAIChatHeaders(req, auth, "xai-token", true, "conv-1", "grok-4.5")
 
 		if got := req.Header.Get("Authorization"); got != "Bearer xai-token" {
 			t.Fatalf("Authorization = %q, want Bearer xai-token", got)
@@ -1818,6 +1818,9 @@ func TestApplyXAIChatHeaders(t *testing.T) {
 		if got := req.Header.Get(xaiClientVersionHeader); got != "" {
 			t.Fatalf("%s = %q, want empty for official API", xaiClientVersionHeader, got)
 		}
+		if got := req.Header.Get(xaiModelOverrideHeader); got != "" {
+			t.Fatalf("%s = %q, want empty for official API", xaiModelOverrideHeader, got)
+		}
 	})
 
 	t.Run("OAuth defaults to cli chat proxy headers", func(t *testing.T) {
@@ -1827,20 +1830,77 @@ func TestApplyXAIChatHeaders(t *testing.T) {
 				"auth_kind": "oauth",
 				"base_url":  xaiauth.DefaultAPIBaseURL,
 			},
+			Metadata: map[string]any{
+				"sub":   "user-sub-1",
+				"email": "user@example.com",
+			},
 		}
-		applyXAIChatHeaders(req, auth, "xai-token", true, "conv-1")
+		applyXAIChatHeaders(req, auth, "xai-token", true, "conv-1", "grok-4.5")
 
 		if got := req.Header.Get("Authorization"); got != "Bearer xai-token" {
 			t.Fatalf("Authorization = %q, want Bearer xai-token", got)
 		}
-		if got := req.Header.Get("x-grok-conv-id"); got != "conv-1" {
-			t.Fatalf("x-grok-conv-id = %q, want conv-1", got)
+		if got := req.Header.Get(xaiConvIDHeader); got != "conv-1" {
+			t.Fatalf("%s = %q, want conv-1", xaiConvIDHeader, got)
 		}
 		if got := req.Header.Get(xaiTokenAuthHeader); got != xaiTokenAuthValue {
 			t.Fatalf("%s = %q, want %q", xaiTokenAuthHeader, got, xaiTokenAuthValue)
 		}
 		if got := req.Header.Get(xaiClientVersionHeader); got != xaiClientVersionValue {
 			t.Fatalf("%s = %q, want %q", xaiClientVersionHeader, got, xaiClientVersionValue)
+		}
+		if got := req.Header.Get(xaiClientIdentifierHeader); got != xaiClientIdentifierValue {
+			t.Fatalf("%s = %q, want %q", xaiClientIdentifierHeader, got, xaiClientIdentifierValue)
+		}
+		if got := req.Header.Get(xaiClientNameHeader); got != xaiClientNameValue {
+			t.Fatalf("%s = %q, want %q", xaiClientNameHeader, got, xaiClientNameValue)
+		}
+		if got := req.Header.Get(xaiClientSurfaceHeader); got != xaiClientSurfaceValue {
+			t.Fatalf("%s = %q, want %q", xaiClientSurfaceHeader, got, xaiClientSurfaceValue)
+		}
+		if got := req.Header.Get(xaiAuthenticateResponseHeader); got != xaiAuthenticateResponseValue {
+			t.Fatalf("%s = %q, want %q", xaiAuthenticateResponseHeader, got, xaiAuthenticateResponseValue)
+		}
+		if got := req.Header.Get(xaiModelOverrideHeader); got != "grok-4.5" {
+			t.Fatalf("%s = %q, want grok-4.5", xaiModelOverrideHeader, got)
+		}
+		if got := req.Header.Get(xaiSessionIDHeader); got != "conv-1" {
+			t.Fatalf("%s = %q, want conv-1", xaiSessionIDHeader, got)
+		}
+		if got := req.Header.Get(xaiAgentIDHeader); got != "conv-1" {
+			t.Fatalf("%s = %q, want conv-1", xaiAgentIDHeader, got)
+		}
+		reqID := req.Header.Get(xaiReqIDHeader)
+		if reqID == "" {
+			t.Fatalf("%s is empty", xaiReqIDHeader)
+		}
+		if got := req.Header.Get(xaiRequestIDLegacyHeader); got != reqID {
+			t.Fatalf("%s = %q, want %q", xaiRequestIDLegacyHeader, got, reqID)
+		}
+		if got := req.Header.Get(xaiSessionIDLegacyHeader); got != "conv-1" {
+			t.Fatalf("%s = %q, want conv-1", xaiSessionIDLegacyHeader, got)
+		}
+		if got := req.Header.Get(xaiConversationIDLegacyHeader); got != "conv-1" {
+			t.Fatalf("%s = %q, want conv-1", xaiConversationIDLegacyHeader, got)
+		}
+		if got := req.Header.Get(xaiUserIDHeader); got != "user-sub-1" {
+			t.Fatalf("%s = %q, want user-sub-1", xaiUserIDHeader, got)
+		}
+		if got := req.Header.Get(xaiEmailHeader); got != "user@example.com" {
+			t.Fatalf("%s = %q, want user@example.com", xaiEmailHeader, got)
+		}
+		if got := req.Header.Get("User-Agent"); got != xaiCLIChatUserAgent() {
+			t.Fatalf("User-Agent = %q, want %q", got, xaiCLIChatUserAgent())
+		}
+		traceparent := req.Header.Get("traceparent")
+		if !strings.HasPrefix(traceparent, "00-") || !strings.HasSuffix(traceparent, "-01") {
+			t.Fatalf("traceparent = %q, want W3C 00-...-01 form", traceparent)
+		}
+		if parts := strings.Split(traceparent, "-"); len(parts) != 4 || len(parts[1]) != 32 || len(parts[2]) != 16 {
+			t.Fatalf("traceparent = %q, want 00-<32hex>-<16hex>-01", traceparent)
+		}
+		if _, ok := req.Header["Tracestate"]; !ok {
+			t.Fatalf("tracestate header missing")
 		}
 	})
 
@@ -1852,13 +1912,16 @@ func TestApplyXAIChatHeaders(t *testing.T) {
 				xaiUsingAPIAttr: "false",
 			},
 		}
-		applyXAIChatHeaders(req, auth, "xai-token", false, "")
+		applyXAIChatHeaders(req, auth, "xai-token", false, "", "grok-4.5")
 
 		if got := req.Header.Get(xaiTokenAuthHeader); got != "" {
 			t.Fatalf("%s = %q, want empty for custom gateway", xaiTokenAuthHeader, got)
 		}
 		if got := req.Header.Get(xaiClientVersionHeader); got != "" {
 			t.Fatalf("%s = %q, want empty for custom gateway", xaiClientVersionHeader, got)
+		}
+		if got := req.Header.Get(xaiModelOverrideHeader); got != "" {
+			t.Fatalf("%s = %q, want empty for custom gateway", xaiModelOverrideHeader, got)
 		}
 	})
 
@@ -1870,15 +1933,22 @@ func TestApplyXAIChatHeaders(t *testing.T) {
 				xaiUsingAPIAttr:                    "false",
 				"header:" + xaiTokenAuthHeader:     "custom-token-auth",
 				"header:" + xaiClientVersionHeader: "custom-client-version",
+				"header:User-Agent":                "custom-ua/1.0",
 			},
 		}
-		applyXAIChatHeaders(req, auth, "xai-token", true, "")
+		applyXAIChatHeaders(req, auth, "xai-token", true, "sess-1", "grok-4.5")
 
 		if got := req.Header.Get(xaiTokenAuthHeader); got != "custom-token-auth" {
 			t.Fatalf("%s = %q, want custom-token-auth", xaiTokenAuthHeader, got)
 		}
 		if got := req.Header.Get(xaiClientVersionHeader); got != "custom-client-version" {
 			t.Fatalf("%s = %q, want custom-client-version", xaiClientVersionHeader, got)
+		}
+		if got := req.Header.Get("User-Agent"); got != "custom-ua/1.0" {
+			t.Fatalf("User-Agent = %q, want custom-ua/1.0", got)
+		}
+		if got := req.Header.Get(xaiModelOverrideHeader); got != "grok-4.5" {
+			t.Fatalf("%s = %q, want grok-4.5", xaiModelOverrideHeader, got)
 		}
 	})
 
@@ -1890,13 +1960,45 @@ func TestApplyXAIChatHeaders(t *testing.T) {
 				xaiUsingAPIAttr: "false",
 			},
 		}
-		applyXAIChatHeaders(req, auth, "xai-token", true, "")
+		applyXAIChatHeaders(req, auth, "xai-token", true, "", "grok-build")
 
 		if got := req.Header.Get(xaiTokenAuthHeader); got != xaiTokenAuthValue {
 			t.Fatalf("%s = %q, want %q", xaiTokenAuthHeader, got, xaiTokenAuthValue)
 		}
 		if got := req.Header.Get(xaiClientVersionHeader); got != xaiClientVersionValue {
 			t.Fatalf("%s = %q, want %q", xaiClientVersionHeader, got, xaiClientVersionValue)
+		}
+		if got := req.Header.Get(xaiAuthenticateResponseHeader); got != xaiAuthenticateResponseValue {
+			t.Fatalf("%s = %q, want %q", xaiAuthenticateResponseHeader, got, xaiAuthenticateResponseValue)
+		}
+		if got := req.Header.Get(xaiModelOverrideHeader); got != "grok-build" {
+			t.Fatalf("%s = %q, want grok-build", xaiModelOverrideHeader, got)
+		}
+		sessionID := req.Header.Get(xaiSessionIDHeader)
+		if sessionID == "" {
+			t.Fatalf("%s is empty when sessionID missing", xaiSessionIDHeader)
+		}
+		if got := req.Header.Get(xaiAgentIDHeader); got == "" {
+			t.Fatalf("%s is empty when sessionID missing", xaiAgentIDHeader)
+		}
+		reqID := req.Header.Get(xaiReqIDHeader)
+		if reqID == "" {
+			t.Fatalf("%s is empty", xaiReqIDHeader)
+		}
+		if got := req.Header.Get(xaiConvIDHeader); got != sessionID {
+			t.Fatalf("%s = %q, want generated session %q", xaiConvIDHeader, got, sessionID)
+		}
+		if got := req.Header.Get(xaiSessionIDLegacyHeader); got != sessionID {
+			t.Fatalf("%s = %q, want %q", xaiSessionIDLegacyHeader, got, sessionID)
+		}
+		if got := req.Header.Get(xaiConversationIDLegacyHeader); got != sessionID {
+			t.Fatalf("%s = %q, want %q", xaiConversationIDLegacyHeader, got, sessionID)
+		}
+		if got := req.Header.Get(xaiRequestIDLegacyHeader); got != reqID {
+			t.Fatalf("%s = %q, want %q", xaiRequestIDLegacyHeader, got, reqID)
+		}
+		if got := req.Header.Get("traceparent"); got == "" {
+			t.Fatalf("traceparent is empty")
 		}
 	})
 }
