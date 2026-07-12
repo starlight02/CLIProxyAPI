@@ -299,6 +299,12 @@ type XAIConfig struct {
 	// Default false so cache injection and real native search can coexist.
 	// Set true only for bait-only pools that must never surface server search.
 	HideInjectedSearchResults bool `yaml:"hide-injected-search-results" json:"hide-injected-search-results"`
+
+	// AutoDisableOnPermissionDenied permanently disables an xAI auth file when the
+	// upstream returns HTTP 403 with code/message permission-denied.
+	// Default false. When true, the auth is marked disabled in its token file so it
+	// is not selected again until manually re-enabled.
+	AutoDisableOnPermissionDenied bool `yaml:"auto-disable-on-permission-denied" json:"auto-disable-on-permission-denied"`
 }
 
 // TLSConfig holds HTTPS server settings.

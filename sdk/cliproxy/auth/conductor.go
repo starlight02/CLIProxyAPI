@@ -3756,7 +3756,11 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 								shouldSuspendModel = true
 							}
 						case 402, 403:
-							if disableCooling {
+							if statusCode == http.StatusForbidden && shouldAutoDisableXAIPermissionDenied(m, auth, result.Error) {
+								applyAuthDisabledForPermissionDenied(auth, result.Error, now)
+								suspendReason = "permission_denied"
+								shouldSuspendModel = true
+							} else if disableCooling {
 								state.NextRetryAfter = time.Time{}
 							} else {
 								next := now.Add(30 * time.Minute)
@@ -3806,13 +3810,19 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						}
 					}
 
-					auth.Status = StatusError
+					if !(auth.Disabled || auth.Status == StatusDisabled) {
+						auth.Status = StatusError
+					}
 					auth.UpdatedAt = now
 					updateAggregatedAvailability(auth, now)
 				}
 			} else {
-				disableCooling := m.cooldownDisabledForAuth(auth)
-				applyAuthFailureState(auth, result.Error, result.RetryAfter, now, disableCooling)
+				if statusCodeFromResult(result.Error) == http.StatusForbidden && shouldAutoDisableXAIPermissionDenied(m, auth, result.Error) {
+					applyAuthDisabledForPermissionDenied(auth, result.Error, now)
+				} else {
+					disableCooling := m.cooldownDisabledForAuth(auth)
+					applyAuthFailureState(auth, result.Error, result.RetryAfter, now, disableCooling)
+				}
 			}
 		}
 
@@ -3837,7 +3847,10 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	if setModelQuota && result.Model != "" {
 		registry.GetGlobalRegistry().SetModelQuotaExceeded(result.AuthID, result.Model)
 	}
-	if shouldResumeModel {
+	if authSnapshot != nil && (authSnapshot.Disabled || authSnapshot.Status == StatusDisabled) {
+		// Permanent disable removes the auth from model routing entirely.
+		registry.GetGlobalRegistry().UnregisterClient(result.AuthID)
+	} else if shouldResumeModel {
 		registry.GetGlobalRegistry().ResumeClientModel(result.AuthID, result.Model)
 	} else if shouldSuspendModel {
 		registry.GetGlobalRegistry().SuspendClientModel(result.AuthID, result.Model, suspendReason)
@@ -4134,6 +4147,115 @@ func isModelSupportError(err error) bool {
 		return false
 	}
 	return isModelSupportErrorMessage(err.Error())
+}
+
+// shouldAutoDisableXAIPermissionDenied reports whether an xAI auth should be
+// permanently disabled after a 403 permission-denied response.
+func shouldAutoDisableXAIPermissionDenied(m *Manager, auth *Auth, resultErr *Error) bool {
+	if m == nil || auth == nil || resultErr == nil {
+		return false
+	}
+	if auth.Disabled || auth.Status == StatusDisabled {
+		return false
+	}
+	if !isXAIProvider(auth) {
+		return false
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg == nil || !cfg.XAI.AutoDisableOnPermissionDenied {
+		return false
+	}
+	return isXAIPermissionDeniedResultError(resultErr)
+}
+
+func isXAIProvider(auth *Auth) bool {
+	if auth == nil {
+		return false
+	}
+	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+	switch provider {
+	case "xai", "x-ai", "x.ai", "grok":
+		return true
+	}
+	if auth.Attributes != nil {
+		if t := strings.ToLower(strings.TrimSpace(auth.Attributes["type"])); t == "xai" || t == "grok" {
+			return true
+		}
+	}
+	if auth.Metadata != nil {
+		if t := strings.ToLower(fmt.Sprint(auth.Metadata["type"])); t == "xai" || t == "grok" {
+			return true
+		}
+	}
+	// File-backed xAI credentials are commonly named xai-*.json.
+	name := strings.ToLower(strings.TrimSpace(auth.FileName))
+	if name == "" {
+		name = strings.ToLower(strings.TrimSpace(auth.ID))
+	}
+	base := filepath.Base(name)
+	return strings.HasPrefix(base, "xai-") || strings.HasPrefix(base, "xai_")
+}
+
+func isXAIPermissionDeniedResultError(err *Error) bool {
+	if err == nil || statusCodeFromResult(err) != http.StatusForbidden {
+		return false
+	}
+	return isXAIPermissionDeniedMessage(err.Code) || isXAIPermissionDeniedMessage(err.Message)
+}
+
+func isXAIPermissionDeniedMessage(message string) bool {
+	lower := strings.ToLower(strings.TrimSpace(message))
+	if lower == "" {
+		return false
+	}
+	if strings.Contains(lower, "permission-denied") || strings.Contains(lower, "permission_denied") {
+		return true
+	}
+	// Upstream also returns a stable human-readable denial for chat endpoint access.
+	if strings.Contains(lower, "access to the chat endpoint is denied") {
+		return true
+	}
+	return false
+}
+
+func applyAuthDisabledForPermissionDenied(auth *Auth, resultErr *Error, now time.Time) {
+	if auth == nil {
+		return
+	}
+	auth.Disabled = true
+	auth.Status = StatusDisabled
+	auth.Unavailable = true
+	auth.NextRetryAfter = time.Time{}
+	auth.UpdatedAt = now
+	msg := "disabled after xAI permission-denied"
+	if resultErr != nil {
+		if detail := strings.TrimSpace(resultErr.Message); detail != "" {
+			msg = "disabled after xAI permission-denied: " + detail
+		}
+		auth.LastError = cloneError(resultErr)
+	}
+	auth.StatusMessage = msg
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.Metadata["disabled"] = true
+	auth.Metadata["disabled_reason"] = "xai_permission_denied"
+	auth.Metadata["disabled_at"] = now.UTC().Format(time.RFC3339)
+	// Mark every known model state unavailable so session affinity fails over immediately.
+	for _, state := range auth.ModelStates {
+		if state == nil {
+			continue
+		}
+		state.Unavailable = true
+		state.Status = StatusDisabled
+		state.StatusMessage = msg
+		state.NextRetryAfter = time.Time{}
+		state.UpdatedAt = now
+		if resultErr != nil {
+			state.LastError = cloneError(resultErr)
+		}
+	}
+	log.Warnf("xai auto-disable: auth %s permanently disabled after permission-denied", auth.ID)
 }
 
 func isInvalidGrantErrorMessage(message string) bool {

@@ -195,6 +195,9 @@ codex:
 #   # When true (and inject is on), strip web_search_call/x_search_call from
 #   # client responses. Default false — prefer leaving results visible.
 #   hide-injected-search-results: false
+#   # Permanently disable an xAI auth file after upstream 403 permission-denied.
+#   # Default false. Re-enable manually via management API / auth file.
+#   auto-disable-on-permission-denied: false
 
 # When true, enable authentication for the WebSocket API (/v1/ws).
 ws-auth: true
